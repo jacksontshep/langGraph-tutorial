@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>World News</title>
+  <style>
+    table {
+      border-collapse: collapse;
+      margin: 10px 0;
+      display: inline-block;
+      margin-right: 10px;
+    }
+  </style>
+</head>
+<body>
+    <h1>World News</h1>
+    <label for="topic"> Topic:</label>
+    <input type="text" id="topic" maxlength="50" placeholder="Nodesource">
+    <button id="news-lookup" disabled>News Lookup</button>
+    <br>
+    <label for="user-input"> User Input:</label>
+    <pre id="user-input"></pre>
+    <label for="news"> News:</label>
+    <pre id="news" maxlength="200"></pre>
+    <script>
+        let socket
+        let reconnectInterval = 1000
+        let automaticInterval
+        let session_id
+    
+        function connectWebSocket() {
+          console.log('Attempting to connect to WebSocket')
+          socket = new WebSocket(`ws://${window.location.hostname}:2999/ws`)
+    
+          socket.onopen = () => {
+            console.log('WebSocket connection established')
+            document.getElementById('news-lookup').disabled = false
+            reconnectInterval = 1000; // Reset the reconnect interval on successful connection
+          }
+    
+          socket.onmessage = event => {
+            console.log('Received message:', event.data)
+            const { news } = JSON.parse(event.data)
+            displayNews({ news, topic })
+          }
+    
+          socket.onerror = error => {
+            console.error('WebSocket error:', error)
+          }
+    
+          socket.onclose = () => {
+            console.log('WebSocket connection closed')
+            document.getElementById('news-lookup').disabled = true
+            setTimeout(connectWebSocket, reconnectInterval)
+            reconnectInterval = Math.min(reconnectInterval * 2, 30000) // Exponential backoff, up to 30 seconds
+          }
+        }
+    
+        document.getElementById('news-lookup').onclick = () => {
+          const topic = document.getElementById('topic').value.trim()
+          if (!topic) return
+          if (!session_id) session_id = Math.random()
+          if (socket.readyState === WebSocket.OPEN) {
+            console.log('Sending message: lookup news')
+            socket.send(JSON.stringify({ command: 'lookup news', topic, session_id }))
+          } else {
+            console.log('WebSocket not open:', socket.readyState)
+          }
+        }
+
+        function displayNews({ news, topic }) {
+            document.getElementById('topic').textContent = topic
+            document.getElementById('news').textContent = news
+        }
+    
+        connectWebSocket()
+      </script>
+    </body>
+    </html>
