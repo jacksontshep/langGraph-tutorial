@@ -8,48 +8,126 @@ import { ChatPromptTemplate, MessagesPlaceholder } from '@langchain/core/prompts
 import { StructuredTool } from '@langchain/core/tools'
 import { Runnable } from '@langchain/core/runnables'
 import { convertToOpenAITool } from '@langchain/core/utils/function_calling'
+import { zodToJsonSchema } from 'zod-to-json-schema'
+import { z } from 'zod'
 
 import { createServer } from 'http'
 import express from 'express'
 import { WebSocketServer } from 'ws'
 
+// JSON Schema definitions for structured reasoning
+const ResearcherResponseSchema = z.object({
+  reasoning: z.object({
+    query_analysis: z.string().describe("Analysis of what information is needed"),
+    search_strategy: z.string().describe("Strategy for finding relevant information"),
+    tool_selection: z.string().describe("Why this tool was chosen")
+  }),
+  action: z.object({
+    type: z.enum(["use_tool", "provide_findings"]).describe("Type of action to take"),
+    tool_name: z.string().optional().describe("Name of tool to use if type is use_tool"),
+    findings: z.string().optional().describe("Research findings if type is provide_findings")
+  }),
+  metadata: z.object({
+    confidence: z.number().min(0).max(1).describe("Confidence in findings (0-1)"),
+    sources_needed: z.boolean().describe("Whether more sources are needed")
+  })
+})
+
+const SummarizerResponseSchema = z.object({
+  reasoning: z.object({
+    information_assessment: z.string().describe("Assessment of gathered information"),
+    key_themes: z.array(z.string()).describe("Main themes identified"),
+    synthesis_approach: z.string().describe("How information will be synthesized")
+  }),
+  summary: z.object({
+    headline: z.string().describe("Compelling headline for the summary"),
+    overview: z.string().describe("High-level overview paragraph"),
+    key_points: z.array(z.object({
+      point: z.string(),
+      details: z.string()
+    })).describe("Structured key points with details"),
+    insights: z.string().describe("Analysis and insights"),
+    conclusion: z.string().describe("Concluding thoughts")
+  }),
+  metadata: z.object({
+    completeness: z.number().min(0).max(1).describe("How complete the information is (0-1)"),
+    topic_coverage: z.array(z.string()).describe("Topics covered in summary")
+  })
+})
+
 async function createAgent({
   llm,
   tools,
   systemMessage,
+  responseSchema,
 }: {
   llm: ChatOpenAI;
   tools: StructuredTool[];
   systemMessage: string;
+  responseSchema?: z.ZodObject<any>;
 }): Promise<Runnable> {
   const toolNames = tools.map((tool) => tool.name).join(", ");
   const formattedTools = tools.map((t) => convertToOpenAITool(t));
 
+  let systemPrompt = "You are a helpful AI assistant, collaborating with other assistants." +
+    " Use the provided tools to progress towards answering the question." +
+    " If you are unable to fully answer, that's OK, another assistant with different tools " +
+    " will help where you left off. Execute what you can to make progress." +
+    " If you or any of the other assistants have the final answer or deliverable," +
+    " prefix your response with FINAL ANSWER so the team knows to stop." +
+    " You have access to the following tools: {tool_names}.\n{system_message}";
+
+  if (responseSchema) {
+    systemPrompt += "\n\nYou MUST respond in JSON format following this schema. Think through your reasoning step-by-step in the reasoning section before taking action.";
+  }
+
   let prompt = ChatPromptTemplate.fromMessages([
-    [
-      "system",
-      "You are a helpful AI assistant, collaborating with other assistants." +
-      " Use the provided tools to progress towards answering the question." +
-      " If you are unable to fully answer, that's OK, another assistant with different tools " +
-      " will help where you left off. Execute what you can to make progress." +
-      " If you or any of the other assistants have the final answer or deliverable," +
-      " prefix your response with FINAL ANSWER so the team knows to stop." +
-      " You have access to the following tools: {tool_names}.\n{system_message}",
-    ],
+    ["system", systemPrompt],
     new MessagesPlaceholder("messages"),
   ]);
+  
   prompt = await prompt.partial({
     system_message: systemMessage,
     tool_names: toolNames,
   });
 
-  return prompt.pipe(llm.bind({ tools: formattedTools }));
+  // Bind tools and optionally enforce JSON response format
+  const bindConfig: any = { tools: formattedTools };
+  
+  if (responseSchema) {
+    bindConfig.response_format = {
+      type: "json_schema",
+      json_schema: {
+        name: "agent_response",
+        strict: true,
+        schema: zodToJsonSchema(responseSchema)
+      }
+    };
+  }
+
+  return prompt.pipe(llm.bind(bindConfig));
 }
 
 import { BaseMessage } from "@langchain/core/messages";
 import { Annotation } from "@langchain/langgraph";
 import { TavilySearchResults } from '@langchain/community/tools/tavily_search'
 import { SystemMessage } from '@langchain/core/messages'
+
+// Helper function to format JSON summary into readable text
+function formatSummaryFromJSON(summary: any): string {
+  let formatted = `# ${summary.headline}\n\n`;
+  formatted += `${summary.overview}\n\n`;
+  formatted += `## Key Points\n\n`;
+  
+  for (const kp of summary.key_points) {
+    formatted += `**${kp.point}**\n${kp.details}\n\n`;
+  }
+  
+  formatted += `## Insights\n\n${summary.insights}\n\n`;
+  formatted += `## Conclusion\n\n${summary.conclusion}`;
+  
+  return formatted;
+}
 
 // This defines the object that is passed between each node
 // in the graph. We will create different nodes for each agent and tool
@@ -77,14 +155,6 @@ const llm = new ChatOpenAI({
   model: 'gpt-4',
   temperature: 0
 })
-
-function shouldContinue({ messages }: typeof MessagesAnnotation.State) {
-    const lastMessage = messages[messages.length - 1] as AIMessage
-    if (lastMessage.tool_calls?.length) {
-        return "tools"
-    }
-    return "__end__"
-}
  
 import { RunnableConfig } from '@langchain/core/runnables'
 
@@ -100,8 +170,24 @@ async function runAgentNode(props: {
   
   let result = await agent.invoke(state, config);
   
-  console.log(`✅ ${name} completed execution`);
-  console.log(`📝 ${name} response preview: ${typeof result.content === 'string' ? result.content.substring(0, 100) : '[Complex content]'}...`);
+  // Parse and log JSON response if available
+  if (typeof result.content === 'string') {
+    try {
+      const jsonResponse = JSON.parse(result.content);
+      console.log(`✅ ${name} completed execution`);
+      console.log(`🧠 Reasoning:`, JSON.stringify(jsonResponse.reasoning, null, 2));
+      
+      if (jsonResponse.action) {
+        console.log(`🎯 Action:`, jsonResponse.action.type);
+      }
+      if (jsonResponse.summary) {
+        console.log(`📰 Summary headline:`, jsonResponse.summary.headline);
+      }
+    } catch (e) {
+      console.log(`✅ ${name} completed execution`);
+      console.log(`📝 ${name} response preview: ${result.content.substring(0, 100)}...`);
+    }
+  }
   
   // We convert the agent output into a format that is suitable
   // to append to the global state
@@ -121,7 +207,8 @@ async function runAgentNode(props: {
 const serpAgent = await createAgent({
   llm,
   tools:[getNews],
-  systemMessage: "You should provide accurate information for the summarizer to use"
+  systemMessage: "You should provide accurate information for the summarizer to use. Analyze the query, determine the best search strategy, and gather comprehensive information.",
+  responseSchema: ResearcherResponseSchema
 })
 
 async function serpNode(
@@ -139,7 +226,8 @@ async function serpNode(
 const tavAgent = await createAgent({
   llm,
   tools:[tavNews],
-  systemMessage: "You should provide accurate information for the summarizer to use"
+  systemMessage: "You should provide accurate information for the summarizer to use. Analyze the query, determine the best search strategy, and gather comprehensive information.",
+  responseSchema: ResearcherResponseSchema
 })
 
 const summarizerAgent = await createAgent({
@@ -148,19 +236,15 @@ const summarizerAgent = await createAgent({
   systemMessage: `You are a news summarizer. Your job is to:
 
 1. Analyze information gathered by the research agents
-2. Create a comprehensive, well-structured summary with proper formatting
-3. Highlight the most important developments and trends
-4. Provide insights and context about the topic
-5. Keep the response informative but conversational
-6. Use line breaks and paragraphs to make the response easy to read
+2. Identify key themes and patterns in the information
+3. Create a comprehensive, well-structured summary with proper formatting
+4. Highlight the most important developments and trends
+5. Provide insights and context about the topic
+6. Keep the response informative but conversational
 7. Do NOT include "FINAL ANSWER" in your response
 
-Format your response with:
-- Clear paragraph breaks between different topics
-- Bullet points for key highlights when appropriate
-- Proper spacing for readability
-
-Synthesize all the research into a cohesive, engaging, well-formatted news summary.`
+Think through your synthesis approach in the reasoning section, then provide a structured summary with headline, overview, key points, insights, and conclusion.`,
+  responseSchema: SummarizerResponseSchema
 })
 
 async function tavNode(
@@ -279,14 +363,26 @@ async function generateNews (topic: string, session_id: string) {
       
       console.log(`🎯 Workflow completed with ${output.messages.length} total messages`);
       const finalMessage = output.messages.at(-1);
-      const preview = typeof finalMessage?.content === 'string' 
-        ? finalMessage.content.substring(0, 200) 
-        : '[Complex content]';
-      console.log(`📄 Final output preview: ${preview}...`);
       
-      return output
+      // Parse and format the final JSON response
+      let formattedSummary: string | undefined;
+      if (typeof finalMessage?.content === 'string') {
+        try {
+          const jsonResponse = JSON.parse(finalMessage.content);
+          if (jsonResponse.summary) {
+            // Format the structured summary into readable text
+            formattedSummary = formatSummaryFromJSON(jsonResponse.summary);
+            console.log(`📄 Final summary generated`);
+          }
+        } catch (e) {
+          console.log(`📄 Final output preview: ${finalMessage.content.substring(0, 200)}...`);
+        }
+      }
+      
+      return { output, formattedSummary }
     } catch (err) {
       console.error(`❌ Workflow error:`, err)
+      return { output: undefined, formattedSummary: undefined }
     }
   }
 
@@ -302,8 +398,9 @@ wss.on('connection', socket => {
     try {
       const { command, topic, session_id } = JSON.parse(raw)
       if (command === 'lookup news') {
-        const output = await generateNews(topic, session_id)
-        const news = output?.messages?.at(-1)?.content || 'No response available'
+        const result = await generateNews(topic, session_id)
+        // Use formatted summary if available, otherwise fall back to raw content
+        const news = result?.formattedSummary || result?.output?.messages?.at(-1)?.content || 'No response available'
         socket.send(JSON.stringify({ news }))
       }
     } catch (e) {
